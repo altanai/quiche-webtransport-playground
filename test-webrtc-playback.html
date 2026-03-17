@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OBS WebRTC Stream Viewer</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 50px auto;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #fff;
+        }
+        h1 {
+            color: #00d8ff;
+        }
+        .container {
+            background: #2a2a2a;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        video {
+            width: 100%;
+            max-width: 800px;
+            background: #000;
+            border-radius: 4px;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        input {
+            padding: 8px;
+            width: 400px;
+            margin-right: 10px;
+            border-radius: 4px;
+            border: 1px solid #444;
+            background: #333;
+            color: #fff;
+        }
+        button {
+            padding: 8px 20px;
+            background: #00d8ff;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            color: #000;
+            font-weight: bold;
+        }
+        button:hover {
+            background: #00b8df;
+        }
+        button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-family: monospace;
+        }
+        .status.info {
+            background: #2a4a5a;
+            border-left: 4px solid #00d8ff;
+        }
+        .status.error {
+            background: #5a2a2a;
+            border-left: 4px solid #ff4444;
+        }
+        .status.success {
+            background: #2a5a2a;
+            border-left: 4px solid #44ff44;
+        }
+        .stats {
+            font-family: monospace;
+            font-size: 12px;
+            color: #aaa;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎥 OBS WebRTC Stream Viewer (WHEP)</h1>
+    
+    <div class="container">
+        <div class="controls">
+            <label>WHEP Endpoint URL:</label><br>
+            <input type="text" id="whepUrl" value="http://localhost:8889/mystream/whep" placeholder="Enter WHEP URL">
+            <button id="connectBtn" onclick="connectStream()">Connect</button>
+            <button id="disconnectBtn" onclick="disconnectStream()" disabled>Disconnect</button>
+        </div>
+        
+        <div id="status"></div>
+        
+        <video id="video" autoplay controls playsinline muted></video>
+        
+        <div class="stats" id="stats">
+            Not connected
+        </div>
+    </div>
+
+    <div class="container">
+        <h3>📝 Instructions</h3>
+        <ol>
+            <li>Start a WHIP server (e.g., mediamtx on port 8889)</li>
+            <li>Configure OBS: Settings → Stream → Service: "WHIP Service"</li>
+            <li>Set WHIP URL in OBS: <code>http://localhost:8889/mystream/whip</code></li>
+            <li>Click "Start Streaming" in OBS</li>
+            <li>Click "Connect" button above to view the stream</li>
+        </ol>
+        
+        <h3>🔧 Alternative Test URLs</h3>
+        <ul>
+            <li><strong>Local mediamtx:</strong> http://localhost:8889/mystream/whep</li>
+            <li><strong>Cloudflare Stream:</strong> https://customer-[code].cloudflarestream.com/[stream-id]/whep</li>
+            <li><strong>Custom server:</strong> Replace with your WHEP endpoint</li>
+        </ul>
+    </div>
+
+    <script>
+        let pc = null;
+        let statsInterval = null;
+
+        function log(message, type = 'info') {
+            const statusDiv = document.getElementById('status');
+            const timestamp = new Date().toLocaleTimeString();
+            statusDiv.innerHTML = `<div class="status ${type}">[${timestamp}] ${message}</div>` + statusDiv.innerHTML;
+            console.log(`[${type.toUpperCase()}]`, message);
+        }
+
+        async function connectStream() {
+            const whepUrl = document.getElementById('whepUrl').value;
+            const videoElement = document.getElementById('video');
+            const connectBtn = document.getElementById('connectBtn');
+            const disconnectBtn = document.getElementById('disconnectBtn');
+
+            if (!whepUrl) {
+                log('Please enter a WHEP URL', 'error');
+                return;
+            }
+
+            try {
+                connectBtn.disabled = true;
+                log('Initializing WebRTC PeerConnection...', 'info');
+
+                // Create peer connection
+                pc = new RTCPeerConnection({
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' }
+                    ]
+                });
+
+                // Handle incoming tracks
+                pc.ontrack = (event) => {
+                    log(`Received ${event.track.kind} track`, 'success');
+                    if (event.streams && event.streams[0]) {
+                        videoElement.srcObject = event.streams[0];
+                        log('Stream attached to video element', 'success');
+                    }
+                };
+
+                // Handle connection state changes
+                pc.onconnectionstatechange = () => {
+                    log(`Connection state: ${pc.connectionState}`, 'info');
+                    if (pc.connectionState === 'connected') {
+                        startStats();
+                    } else if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+                        stopStats();
+                    }
+                };
+
+                // Handle ICE connection state
+                pc.oniceconnectionstatechange = () => {
+                    log(`ICE connection state: ${pc.iceConnectionState}`, 'info');
+                };
+
+                // Add transceivers for receiving audio and video
+                pc.addTransceiver('video', { direction: 'recvonly' });
+                pc.addTransceiver('audio', { direction: 'recvonly' });
+
+                // Create offer
+                log('Creating WebRTC offer...', 'info');
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+
+                // Wait for ICE gathering to complete
+                await new Promise((resolve) => {
+                    if (pc.iceGatheringState === 'complete') {
+                        resolve();
+                    } else {
+                        pc.onicegatheringstatechange = () => {
+                            if (pc.iceGatheringState === 'complete') {
+                                resolve();
+                            }
+                        };
+                    }
+                });
+
+                log('Sending offer to WHEP server...', 'info');
+
+                // Send offer to WHEP endpoint
+                const response = await fetch(whepUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/sdp'
+                    },
+                    body: pc.localDescription.sdp
+                });
+
+                if (!response.ok) {
+                    throw new Error(`WHEP server responded with ${response.status}: ${response.statusText}`);
+                }
+
+                log('Received answer from WHEP server', 'success');
+                
+                const answerSdp = await response.text();
+                await pc.setRemoteDescription({
+                    type: 'answer',
+                    sdp: answerSdp
+                });
+
+                log('WebRTC connection established successfully!', 'success');
+                disconnectBtn.disabled = false;
+
+            } catch (error) {
+                log(`Error: ${error.message}`, 'error');
+                console.error('Connection error:', error);
+                connectBtn.disabled = false;
+                if (pc) {
+                    pc.close();
+                    pc = null;
+                }
+            }
+        }
+
+        function disconnectStream() {
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            stopStats();
+            
+            const videoElement = document.getElementById('video');
+            videoElement.srcObject = null;
+            
+            document.getElementById('connectBtn').disabled = false;
+            document.getElementById('disconnectBtn').disabled = true;
+            
+            log('Disconnected', 'info');
+        }
+
+        function startStats() {
+            if (statsInterval) return;
+            
+            statsInterval = setInterval(async () => {
+                if (!pc) return;
+                
+                try {
+                    const stats = await pc.getStats();
+                    let statsText = '';
+                    
+                    stats.forEach(report => {
+                        if (report.type === 'inbound-rtp') {
+                            const kind = report.kind || 'unknown';
+                            const bytes = report.bytesReceived || 0;
+                            const packets = report.packetsReceived || 0;
+                            const packetsLost = report.packetsLost || 0;
+                            const jitter = report.jitter || 0;
+                            
+                            statsText += `${kind.toUpperCase()}: ${(bytes / 1024 / 1024).toFixed(2)} MB, ${packets} packets, ${packetsLost} lost, jitter: ${(jitter * 1000).toFixed(2)}ms | `;
+                        }
+                    });
+                    
+                    document.getElementById('stats').textContent = statsText || 'Receiving data...';
+                } catch (error) {
+                    console.error('Stats error:', error);
+                }
+            }, 1000);
+        }
+
+        function stopStats() {
+            if (statsInterval) {
+                clearInterval(statsInterval);
+                statsInterval = null;
+                document.getElementById('stats').textContent = 'Not connected';
+            }
+        }
+
+        // Auto-unmute video on first click
+        document.getElementById('video').addEventListener('click', function() {
+            this.muted = false;
+        });
+
+        log('WebRTC viewer ready. Enter WHEP URL and click Connect.', 'info');
+    </script>
+</body>
+</html>
